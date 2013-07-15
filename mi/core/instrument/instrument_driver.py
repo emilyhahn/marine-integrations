@@ -60,6 +60,7 @@ class ResourceAgentState(BaseEnum):
     DIRECT_ACCESS = 'RESOUCE_AGENT_STATE_DIRECT_ACCESS'
     BUSY = 'RESOURCE_AGENT_STATE_BUSY'
     LOST_CONNECTION = 'RESOURCE_AGENT_STATE_LOST_CONNECTION'
+    ACTIVE_UNKNOWN = 'RESOURCE_AGENT_STATE_ACTIVE_UNKNOWN'
     
 class ResourceAgentEvent(BaseEnum):
     """
@@ -161,6 +162,7 @@ class DriverEvent(BaseEnum):
     CLOCK_SYNC = 'DRIVER_EVENT_CLOCK_SYNC'
     SCHEDULED_CLOCK_SYNC = 'DRIVER_EVENT_SCHEDULED_CLOCK_SYNC'
     ACQUIRE_STATUS = 'DRIVER_EVENT_ACQUIRE_STATUS'
+    INIT_PARAMS = 'DRIVER_EVENT_INIT_PARAMS'
 
 class DriverAsyncEvent(BaseEnum):
     """
@@ -933,6 +935,7 @@ class SingleConnectionInstrumentDriver(InstrumentDriver):
         next_state = None
         result = None
         
+        log.info("_handler_connected_disconnect: invoking stop_comms().")
         self._connection.stop_comms()
         self._protocol = None
         next_state = DriverConnectionState.DISCONNECTED
@@ -949,10 +952,13 @@ class SingleConnectionInstrumentDriver(InstrumentDriver):
         next_state = None
         result = None
         
+        log.info("_handler_connected_connection_lost: invoking stop_comms().")
         self._connection.stop_comms()
         self._protocol = None
         
         # Send async agent state change event.
+        log.info("_handler_connected_connection_lost: sending LOST_CONNECTION " \
+                 "event, moving to DISCONNECTED state.")
         self._driver_event(DriverAsyncEvent.AGENT_EVENT,
                            ResourceAgentEvent.LOST_CONNECTION)
          
@@ -980,7 +986,12 @@ class SingleConnectionInstrumentDriver(InstrumentDriver):
         @retval (next_state, result) tuple, (None, protocol result).
         """
         next_state = None
-        self._pre_da_config = self.get_resource(DriverParameter.ALL)
+
+        # Get the value for all direct access parameters and store them in the protocol
+        self._pre_da_config = self.get_resource(self._protocol.get_direct_access_params())
+        self._protocol.store_direct_access_config(self._pre_da_config)
+        self._protocol.enable_da_initialization()
+        log.debug("starting DA.  Storing DA parameters for restore: %s", self._pre_da_config)
 
         result = self._protocol._protocol_fsm.on_event(event, *args, **kwargs)
         return (next_state, result)
@@ -995,7 +1006,11 @@ class SingleConnectionInstrumentDriver(InstrumentDriver):
         """
         next_state = None
         result = self._protocol._protocol_fsm.on_event(event, *args, **kwargs)
-        self.restore_direct_access_params(self._pre_da_config)
+
+        # Moving the responsibility for applying DA parameters to the
+        # protocol.
+        #self.restore_direct_access_params(self._pre_da_config)
+
         return (next_state, result)
 
     ########################################################################
@@ -1053,11 +1068,16 @@ class SingleConnectionInstrumentDriver(InstrumentDriver):
         """
         
         if not self._connection_lost:
+            log.info("_lost_connection_callback: starting thread to send " \
+                     "CONNECTION_LOST event to instrument driver.")
             self._connection_lost = True
             lost_comms_thread = Thread(
                 target=self._connection_fsm.on_event,
                 args=(DriverEvent.CONNECTION_LOST, ))
             lost_comms_thread.start()
+        else:
+            log.info("_lost_connection_callback: connection_lost flag true.")
+            
             
     def _build_protocol(self):
         """

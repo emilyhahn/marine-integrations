@@ -30,8 +30,6 @@ from mi.core.log import get_logger ; log = get_logger()
 
 import gevent
 import json
-import ntplib
-import time
 
 from pprint import PrettyPrinter
 
@@ -56,6 +54,7 @@ from interface.objects import CapabilityType
 
 from ion.agents.instrument.driver_process import DriverProcess, DriverProcessType
 
+from interface.objects import AgentCommandResult
 from interface.objects import AgentCommand
 
 from mi.idk.util import convert_enum_to_dict
@@ -94,7 +93,7 @@ from ion.agents.instrument.direct_access.direct_access_server import DirectAcces
 from ion.agents.port.port_agent_process import PortAgentProcess
 
 from pyon.core.exception import Conflict
-from pyon.core.exception import ResourceError, BadRequest
+from pyon.core.exception import ResourceError, BadRequest, Timeout, ServerError
 from pyon.agent.agent import ResourceAgentState
 from pyon.agent.agent import ResourceAgentEvent
 from ooi.logging import log
@@ -825,6 +824,46 @@ class DriverTestMixin(MiUnitTest):
         vendor_da_support = option_dict.get(DriverDictKey.VENDOR_SW_COMPATIBLE)
         self.assertIsNotNone(vendor_da_support, "%s not defined in driver options" % DriverDictKey.VENDOR_SW_COMPATIBLE)
 
+    def assert_metadata_generation(self, instrument_params=None, commands=None):
+        """
+        Test that we can generate metadata information for the driver,
+        commands, and parameters. Needs a driver to exist first. Metadata
+        can come from any source (file or code).
+        @param instrumnet_params The list of parameters to compare with the parameter
+        metadata being generated. Could be from an enum class's list() method.
+        @param commands The list of commands to compare with the command
+        metadata being generated. Could be from an enum class's list() method
+        """
+        json_result = self.driver_client.cmd_dvr("get_config_metadata")
+        self.assert_(json_result != None)
+        self.assert_(len(json_result) > 100) # just make sure we have something...
+        result = json.loads(json_result)
+        log.debug("Metadata JSON response: %s", json_result)
+        self.assert_(result != None)
+        self.assert_(isinstance(result, dict))
+
+        # simple driver metadata check
+        self.assertTrue(result[ConfigMetadataKey.DRIVER])
+        self.assertTrue(result[ConfigMetadataKey.DRIVER][DriverDictKey.VENDOR_SW_COMPATIBLE])
+
+        # param metadata check
+        self.assertTrue(result[ConfigMetadataKey.PARAMETERS])        
+        keys = result[ConfigMetadataKey.PARAMETERS].keys()
+        keys.append(DriverParameter.ALL) # toss that in there to match up
+        keys.sort()
+        enum_list = instrument_params
+        enum_list.sort()
+        self.assertEqual(keys, enum_list)
+        
+        # command metadata check 
+        self.assertTrue(result[ConfigMetadataKey.COMMANDS])
+        keys = result[ConfigMetadataKey.COMMANDS].keys()
+        keys.sort()
+        enum_list = commands
+        enum_list.sort()
+        self.assertEqual(keys, enum_list)
+
+
 class InstrumentDriverTestCase(MiIntTestCase):
     """
     Base class for instrument driver tests
@@ -1053,6 +1092,7 @@ class InstrumentDriverTestCase(MiIntTestCase):
             log.debug("after 'process_echo'")
 
             startup_config = driver_config.get('startup_config')
+            log.debug("Setting Startup Params: %s", startup_config)
             retval = driver_client.cmd_dvr('set_init_params', startup_config)
 
             self.driver_client = driver_client
@@ -1144,6 +1184,10 @@ class InstrumentDriverTestCase(MiIntTestCase):
         '''
         sample_length = len(sample)
         self.assertGreater(fragment_size, 0)
+
+        # If the sample length is less then the fragment size then we aren't going to fragment the sample and
+        # this test isn't verifying what we are trying to verify.
+        self.assertGreater(sample_length, fragment_size, msg="Fragment size must be greater than sample length")
         timestamps = []
 
         i = 0
@@ -1274,6 +1318,9 @@ class InstrumentDriverUnitTestCase(InstrumentDriverTestCase):
         
         # run it through json so unicode and everything lines up
         standard = json.dumps(happy_structure, sort_keys=True)
+        
+        log.debug("Parsed Result:\n%s", json.dumps(json.loads(parsed_result), sort_keys = True, indent = 2))
+        log.debug("Standard:\n%s", json.dumps(json.loads(standard), sort_keys = True, indent = 2))
 
         self.assertEqual(parsed_result, standard)
 
@@ -1758,8 +1805,25 @@ class InstrumentDriverIntegrationTestCase(InstrumentDriverTestCase):   # Must in
             if(self._driver_exception_match(badreq, ex)):
                 log.debug("Expected exception raised: %s", ex)
                 return
+        except ResourceError as e:
+            if(self._driver_exception_match(e, ex)):
+                log.debug("Expected exception raised as ResourceError: %s", ex)
+                return
+        except Timeout as e:
+            if(self._driver_exception_match(e, ex)):
+                log.debug("Expected exception raised as Timeout: %s", ex)
+                return
+        except ServerError as e:
+            if(self._driver_exception_match(e, ex)):
+                log.debug("Expected exception raised as ServerError: %s", ex)
+                return
+        except Conflict as e:
+            if(self._driver_exception_match(e, ex)):
+                log.debug("Expected exception raised as Conflict: %s", ex)
+                return
         except Exception as e:
-            self.fail("Call returned bad exception: %s" % e)
+            log.debug("Exception type: %s", type(e))
+            self.fail("Call returned bad exception: %s of type %s" % (e, type(e)))
 
     def _driver_exception_match(self, ion_exception, expected_exception, error_regex=None):
         """
@@ -1804,7 +1868,7 @@ class InstrumentDriverIntegrationTestCase(InstrumentDriverTestCase):   # Must in
         """
         self.assert_set_exception(param, value, exception_class=exception_class)
 
-    def assert_driver_command(self, command, expected=None, regex=None, value_function=None, state=None, delay=0):
+    def assert_driver_command(self, command, expected=None, regex=None, value_function=None, state=None, delay=0, regex_options=re.DOTALL, assert_function=None):
         """
         Verify that we can run a command and that the reply matches if we have
         passed on in.  If we couldn't execute a command we assume an exception
@@ -1812,6 +1876,11 @@ class InstrumentDriverIntegrationTestCase(InstrumentDriverTestCase):   # Must in
         @param command: driver command to execute
         @param expected: expected reply from the command
         @param regex: regex to match reply
+        @param value_function: function that will return a value to be tested
+        @param state: desired protocol state after the command is run.
+        @param delay: how long to wait, in seconds, after the command is executed before we can run tests
+        @param regex_options: options to pass to the regular expression compile
+        @param assert_function: assert method to call
         """
         # Execute the command
         reply = self.driver_client.cmd_dvr('execute_resource', command, )
@@ -1838,7 +1907,8 @@ class InstrumentDriverIntegrationTestCase(InstrumentDriverTestCase):   # Must in
         if(regex != None):
             log.debug("command reply: %s", value)
             self.assertIsNotNone(value)
-            self.assertRegexpMatches(value, regex)
+            compiled = re.compile(regex, regex_options)
+            self.assertRegexpMatches(value, compiled)
 
         if(state != None):
             self.assert_current_state(state)
@@ -1958,6 +2028,7 @@ class InstrumentDriverIntegrationTestCase(InstrumentDriverTestCase):   # Must in
 
         # Walk the driver to command mode.
         self.assert_initialize_driver()
+
         # We explicitly call apply startup params because we don't know if the
         # driver does it for us.  It should, but it is tested in another test.
         self.driver_client.cmd_dvr('apply_startup_params')
@@ -2045,7 +2116,7 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
         InstrumentDriverTestCase.setUp(self)
 
         self.init_port_agent()
-        self.instrument_agent_manager = InstrumentAgentClient();
+        self.instrument_agent_manager = InstrumentAgentClient()
         self.instrument_agent_manager.start_container(deploy_file=self.test_config.container_deploy_file)
 
         self.container = self.instrument_agent_manager.container
@@ -2096,6 +2167,8 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
             'test_mode' : True  ## Enable a poison pill. If the spawning process dies
             ## shutdown the daemon process.
         }
+
+        log.debug("Agent Config: %s", agent_config)
 
         # Start instrument agent client.
         self.instrument_agent_manager.start_client(
@@ -2161,6 +2234,14 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
         state = self.instrument_agent_client.get_agent_state()
         self.assertEqual(state, target_state)
 
+    def assert_resource_state(self, target_state):
+        """
+        Verify the current resource state
+        @param target_state: What we expect the resource state to be
+        """
+        state = self.instrument_agent_client.get_resource_state()
+        self.assertEqual(state, target_state)
+
     def assert_agent_command(self, command, args=None, timeout=None):
         """
         Verify an agent command throws an exception
@@ -2177,7 +2258,49 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
         @param args: kwargs to pass to the agent command object
         """
         cmd = AgentCommand(command=command, kwargs=args)
-        retval = self.instrument_agent_client.execute_resource(cmd, timeout=timeout)
+        return self.instrument_agent_client.execute_resource(cmd, timeout=timeout)
+
+    def assert_resource_command(self, command, args=None, expected=None, regex=None, value_function=None, agent_state=None, resource_state=None, delay=0):
+        """
+        Verify that we can run a command and that the reply matches if we have
+        passed on in.  If we couldn't execute a command we assume an exception
+        will be thrown.
+        @param command: driver command to execute
+        @param expected: expected reply from the command
+        @param regex: regex to match reply
+        """
+        # Execute the command
+        reply = self.assert_execute_resource(command, args)
+        value = None
+
+        if(delay):
+            log.debug("sleeping for a bit: %d", delay)
+            time.sleep(delay)
+
+        # Get the value to check in the reply
+        if(reply != None):
+            if(value_function == None):
+                self.assertIsInstance(reply, AgentCommandResult)
+                log.debug("AAResult: %s", reply)
+                value = reply['result']
+            else:
+                value = value_function(reply)
+
+        if(expected != None):
+            log.debug("command reply: %s", value)
+            self.assertIsNotNone(value)
+            self.assertEqual(value, expected)
+
+        if(regex != None):
+            log.debug("command reply: %s", value)
+            self.assertIsNotNone(value)
+            self.assertRegexpMatches(value, regex)
+
+        if(agent_state != None):
+            self.assert_agent_state(agent_state)
+
+        if(resource_state != None):
+            self.assert_resource_state(resource_state)
 
     def assert_agent_command_exception(self, command, error_regex=None, exception_class=InstrumentStateException, timeout=None):
         """
@@ -2537,17 +2660,20 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
         res_state = self.instrument_agent_client.get_resource_state()
         self.assertEqual(res_state, DriverProtocolState.COMMAND)
 
-    def assert_direct_access_start_telnet(self, timeout=600):
+    def assert_direct_access_start_telnet(self, session_timeout=60, inactivity_timeout=60, timeout=GO_ACTIVE_TIMEOUT):
         """
         @brief This test manually tests that the Instrument Driver properly supports direct access to the physical instrument. (telnet mode)
         """
         self.assert_enter_command_mode()
 
-        # go direct access
-        cmd = AgentCommand(command=ResourceAgentEvent.GO_DIRECT_ACCESS,
-            kwargs={'session_type': DirectAccessTypes.telnet,
-                    'session_timeout':timeout,
-                    'inactivity_timeout':timeout})
+        # Direct access configurations
+        args={'session_type':DirectAccessTypes.telnet}
+        if inactivity_timeout != None: args['inactivity_timeout'] = inactivity_timeout
+        if session_timeout != None: args['session_timeout'] = session_timeout
+
+        log.debug("DA startup parameters: %s", args)
+
+        cmd = AgentCommand(command=ResourceAgentEvent.GO_DIRECT_ACCESS, kwargs=args)
         retval = self.instrument_agent_client.execute_agent(cmd, timeout=timeout)
         log.warn("go_direct_access retval=" + str(retval.result))
 
@@ -2571,15 +2697,18 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
         Exit out of direct access mode.  We do this by simply changing
         state to command mode.
         @return:
-        '''       
+        '''
+        log.debug("Stopping Direct Access")
         state = self.instrument_agent_client.get_agent_state()
         self.assertEqual(state, ResourceAgentState.DIRECT_ACCESS)
 
+        log.debug("Stopping Direct Access: Send Go Command")
         cmd = AgentCommand(command=ResourceAgentEvent.GO_COMMAND)
         retval = self.instrument_agent_client.execute_agent(cmd, timeout=timeout) # ~9s to run
 
+        log.debug("Stopping Direct Access: Checking agent state")
         state = self.instrument_agent_client.get_agent_state()
-        self.assertEqual(state, ResourceAgentState.COMMAND)
+        self.assertNotEqual(state, ResourceAgentState.DIRECT_ACCESS)
 
     def assert_switch_driver_state(self, command, result_state):
         '''
@@ -2638,7 +2767,7 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
                 log.debug("Current state match: %s %s", agent_state, resource_state)
                 return
             log.debug("state mismatch, waiting for state to transition")
-            time.sleep(2)
+            gevent.sleep(2)
 
         if(agent_state != target_agent_state):
             log.error("Failed to transition agent state to %s, current state: %s", target_agent_state, agent_state)
@@ -2802,7 +2931,8 @@ class InstrumentDriverQualificationTestCase(InstrumentDriverTestCase):
         self.assert_reset()
 
         self.assert_enter_command_mode()
-        self.assert_direct_access_start_telnet(timeout=600)
+        self.assert_direct_access_start_telnet(inactivity_timeout=60, session_timeout=60)
+        self.assert_state_change(ResourceAgentState.DIRECT_ACCESS, DriverProtocolState.DIRECT_ACCESS, 30)
         self.assert_reset()
 
     @unittest.skip("Transaction management not yet implemented")

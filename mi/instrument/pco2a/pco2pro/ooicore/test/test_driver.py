@@ -16,7 +16,10 @@ USAGE:
 __author__ = 'E. Hahn'
 __license__ = 'Apache 2.0'
 
+import time
 import unittest
+import re
+from time import strftime, localtime
 
 from nose.plugins.attrib import attr
 from mock import Mock
@@ -43,8 +46,10 @@ from mi.core.instrument.instrument_driver import DriverProtocolState
 
 from mi.core.instrument.data_particle import RawDataParticle
 
+from mi.core.exceptions import InstrumentException
 from mi.core.exceptions import InstrumentProtocolException
 from mi.core.exceptions import InstrumentParameterException
+from mi.core.exceptions import InstrumentCommandException
 
 from ion.agents.instrument.instrument_agent import InstrumentAgentState
 from ion.agents.instrument.direct_access.direct_access_server import DirectAccessTypes
@@ -76,7 +81,7 @@ from mi.instrument.pco2a.pco2pro.ooicore.test.sample_data import *
 ###
 InstrumentDriverTestCase.initialize(
     driver_module='mi.instrument.pco2a.pco2pro.ooicore.driver',
-    driver_class="InstrumentDriver",
+    driver_class="Pco2aInstrumentDriver",
 
     instrument_agent_resource_id = 'HYBCAE',
     instrument_agent_name = 'pco2a_pco2pro_ooicore',
@@ -114,7 +119,7 @@ InstrumentDriverTestCase.initialize(
 # This class defines a configuration structure for testing and common assert  #
 # methods for validating data particles.				      #
 ###############################################################################
-class DriverTestMixinSub(DriverTestMixin):
+class Pco2aTestMixin(DriverTestMixin):
     '''
     Mixin class used for storing data particle constance and common data assertion methods.
     '''
@@ -140,8 +145,11 @@ class DriverTestMixinSub(DriverTestMixin):
                                     STARTUP: True, DEFAULT: 20, VALUE: 20},
         Parameter.AUTO_SAMPLE_MODE : {TYPE: str, READONLY: False,
                                       DA: False, STARTUP: True,
-                                      DEFAULT: AutoSampleMode.HALF_HR_SAMPLE,
-                                      VALUE: AutoSampleMode.HALF_HR_SAMPLE}
+                                      DEFAULT: AutoSampleMode.ONE_HR_SAMPLE,
+                                      VALUE: AutoSampleMode.ONE_HR_SAMPLE},
+        Parameter.ATMOSPHERE_MODE : {TYPE: int, READONLY: False,
+                                     DA: False, STARTUP: True,
+                                     DEFAULT: 2, VALUE: 2}
         }
     _driver_capabilities = {
         # capabilities defined in the IOS
@@ -150,7 +158,6 @@ class DriverTestMixinSub(DriverTestMixin):
         Capability.STOP_AUTOSAMPLE : {STATES: [ProtocolState.COMMAND,
                                                ProtocolState.AUTOSAMPLE]},
         Capability.CLOCK_SYNC : {STATES: [ProtocolState.COMMAND]},
-        Capability.ACQUIRE_STATUS : {STATES: [ProtocolState.COMMAND]},
     }
     
     _air_sample_params = {
@@ -208,18 +215,15 @@ class DriverTestMixinSub(DriverTestMixin):
     ###
     #   Driver Parameter Methods
     ###
-    def assert_driver_parameters(self, current_parameters,
-                                 verify_values = False):
+    def assert_driver_parameters(self, current_parameters, verify_values=False):
         """
         Verify that all driver parameters are correct and potentially verify
         values.
         @param current_parameters: driver parameters read from the driver
         instance
-        @param verify_values: should we verify values against definition?
-        """
-        self.assert_parameters(current_parameters, self._driver_parameters,
-                               verify_values)
-
+        """       
+        self.assert_parameters(current_parameters, self._driver_parameters)
+        
     def assert_particle_air_sample(self, data_particle, verify_values = False):
         '''
         Verify air_sample particle
@@ -229,7 +233,7 @@ class DriverTestMixinSub(DriverTestMixin):
         self.assert_data_particle_keys(Pco2aAirSampleDataParticleKey,
                                        self._air_sample_params)
         self.assert_data_particle_header(data_particle,
-                                         DataParticleType.AIR_SAMPLE)
+                                         DataParticleType.PCO2A_AIR_SAMPLES)
         self.assert_data_particle_parameters(data_particle,
                                              self._air_sample_params,
                                              verify_values)
@@ -244,7 +248,7 @@ class DriverTestMixinSub(DriverTestMixin):
         self.assert_data_particle_keys(Pco2aWaterSampleDataParticleKey,
                                        self._water_sample_params)
         self.assert_data_particle_header(data_particle,
-                                         DataParticleType.WATER_SAMPLE)
+                                         DataParticleType.PCO2A_WATER_SAMPLES)
         self.assert_data_particle_parameters(data_particle,
                                              self._water_sample_params,
                                              verify_values)
@@ -264,10 +268,9 @@ class DriverTestMixinSub(DriverTestMixin):
 #   driver process.                                                           #
 ###############################################################################
 @attr('UNIT', group='mi')
-class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
+class Pco2aUnitTest(InstrumentDriverUnitTestCase, Pco2aTestMixin):
     def setUp(self):
         InstrumentDriverUnitTestCase.setUp(self)
-
 
     def test_driver_enums(self):
         """
@@ -288,13 +291,12 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         self.assert_enum_complete(Capability(), ProtocolEvent())
         
         cmd = convert_enum_to_dict(Command)
-	cmd_char = COMMAND_CHAR
+        cmd_char = COMMAND_CHAR
         self.assert_set_complete(cmd_char, cmd)
         
         asm = convert_enum_to_dict(AutoSampleMode)
         asm_menu_char = AUTO_SAMPLE_MENU_OPTS
         self.assert_set_complete(asm_menu_char, asm)
-
         
     def test_driver_schema(self):
         """
@@ -302,7 +304,6 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         """
         driver = Pco2aInstrumentDriver(self._got_data_event_callback)
         self.assert_driver_schema(driver, self._driver_parameters, self._driver_capabilities)
-
 
     def test_chunker(self):
         """
@@ -320,7 +321,6 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         self.assert_chunker_fragmented_sample(chunker, SAMPLE_WATER, 32)
         self.assert_chunker_combined_sample(chunker, SAMPLE_WATER)
 
-
     def test_got_data(self):
         """
         Verify sample data passed through the got data method produces the correct data particles
@@ -334,7 +334,6 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         # Start validating data particles
         self.assert_particle_published(driver, SAMPLE_AIR, self.assert_particle_air_sample, True)
         self.assert_particle_published(driver, SAMPLE_WATER, self.assert_particle_water_sample, True)
-
 
     def test_protocol_filter_capabilities(self):
         """
@@ -360,17 +359,19 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         also be defined in the protocol FSM.
         """
         capabilities = {
-            ProtocolState.UNKNOWN: ['PROTOCOL_EVENT_DISCOVER_COMMAND'],
-            ProtocolState.DISCOVERY: ['DRIVER_EVENT_START_DIRECT',
-                                      'PROTOCOL_EVENT_DISCOVER_COMMAND'],
-            ProtocolState.COMMAND: ['DRIVER_EVENT_ACQUIRE_STATUS',
-                                    'DRIVER_EVENT_CLOCK_SYNC',
+            ProtocolState.UNKNOWN: ['DRIVER_EVENT_DISCOVER'],
+            ProtocolState.DISCOVERY: ['DRIVER_EVENT_DISCOVER',
+                                      'DRIVER_EVENT_START_DIRECT',
+                                      'PROTOCOL_EVENT_DISCOVER_COMMAND',
+                                      'PROTOCOL_EVENT_DISCOVER_AUTOSAMPLE'],
+            ProtocolState.COMMAND: ['DRIVER_EVENT_CLOCK_SYNC',
                                     'DRIVER_EVENT_GET',
                                     'DRIVER_EVENT_SET',
                                     'DRIVER_EVENT_START_AUTOSAMPLE',
-                                    'DRIVER_EVENT_START_DIRECT'],
+                                    'DRIVER_EVENT_START_DIRECT',
+                                    'PROTOCOL_EVENT_DISCOVER_AUTOSAMPLE'],
             ProtocolState.AUTOSAMPLE: ['DRIVER_EVENT_STOP_AUTOSAMPLE'],
-            ProtocolState.WAIT_FOR_COMMAND: [],
+            ProtocolState.WAIT_FOR_COMMAND: ['PROTOCOL_EVENT_DISCOVER_COMMAND'],
             ProtocolState.DIRECT_ACCESS: ['DRIVER_EVENT_STOP_DIRECT',
                                           'EXECUTE_DIRECT'], 
         }
@@ -379,12 +380,12 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         self.assert_capabilities(driver, capabilities)
         
     def test_to_autosample(self):
-	""" Test to autosample conversion. """
-	self.assertEquals(AutoSampleMode.DAILY_SAMPLE, Protocol._to_autosample('Daily'))
-	self.assertEquals(AutoSampleMode.HALF_HR_SAMPLE, Protocol._to_autosample('30 Minute'))
-	self.assertEquals(AutoSampleMode.CONTINUOUS_SAMPLE, Protocol._to_autosample('Continuous'))
-	self.assertRaises(InstrumentProtocolException,
-			  Protocol._to_autosample, 'Bad String')
+        """ Test to autosample conversion. """
+        self.assertEquals(AutoSampleMode.DAILY_SAMPLE, Protocol._to_autosample('Daily'))
+        self.assertEquals(AutoSampleMode.HALF_HR_SAMPLE, Protocol._to_autosample('30 Minute'))
+        self.assertEquals(AutoSampleMode.CONTINUOUS_SAMPLE, Protocol._to_autosample('Continuous'))
+        self.assertRaises(InstrumentProtocolException,
+                          Protocol._to_autosample, 'Bad String')
         
     def test_from_autosample(self):
         """ Test from autosample conversion. """
@@ -396,8 +397,18 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
         self.assertRaises(InstrumentParameterException,
                           Protocol._from_autosample, 'Bad String')
         
-
-
+    def test_to_menu_wait_time(self):
+        """
+        Test that the conversion from wait time number to the value entered
+        at the menu is correct
+        """
+        self.assertEquals('015', Protocol._to_menu_wait_time(15))
+        self.assertEquals('005', Protocol._to_menu_wait_time(5))
+        self.assertEquals('100', Protocol._to_menu_wait_time(100))
+        self.assertRaises(InstrumentParameterException, Protocol._to_menu_wait_time, 0)
+        self.assertRaises(InstrumentParameterException, Protocol._to_menu_wait_time, 'A')
+        self.assertRaises(InstrumentParameterException, Protocol._to_menu_wait_time, 1500)
+                   
 
 ###############################################################################
 #                            INTEGRATION TESTS                                #
@@ -407,9 +418,251 @@ class DriverUnitTest(InstrumentDriverUnitTestCase, DriverTestMixinSub):
 #     and common for all drivers (minimum requirement for ION ingestion)      #
 ###############################################################################
 @attr('INT', group='mi')
-class DriverIntegrationTest(InstrumentDriverIntegrationTestCase):
+class Pco2aIntegrationTest(InstrumentDriverIntegrationTestCase, Pco2aTestMixin):
     def setUp(self):
         InstrumentDriverIntegrationTestCase.setUp(self)
+                 
+    def test_startup_params(self):
+        """
+        Verify that startup parameters are applied correctly. 
+        """
+        
+        # Explicitly verify these values after discover.  They should match
+        # what the startup values should be
+        get_values = {
+            Parameter.NUMBER_SAMPLES: 5,
+            Parameter.MENU_WAIT_TIME: 20,
+            Parameter.AUTO_SAMPLE_MODE: AutoSampleMode.ONE_HR_SAMPLE,
+            Parameter.ATMOSPHERE_MODE: 2
+        }
+
+        # Change the values of these parameters to something before the
+        # driver is reinitalized.  They should be blown away on reinit.
+        new_values = {
+            Parameter.NUMBER_SAMPLES: 3,
+            Parameter.MENU_WAIT_TIME: 15,
+            Parameter.AUTO_SAMPLE_MODE: AutoSampleMode.HALF_HR_SAMPLE,
+            Parameter.ATMOSPHERE_MODE: 1
+        }
+
+        self.assert_initialize_driver()
+        # make sure startup parameters are set by setting new values, then
+        # re-initializing and checking for init values
+        self.assert_startup_parameters(self.assert_driver_parameters, new_values, get_values)
+        
+    def test_set(self):
+        """
+        Test all set commands. Verify all exception cases.
+        """
+        
+        self.assert_initialize_driver()
+
+        #   Instrument Parameters
+
+        # Number of Samples.  integer 1 - 9
+        self.assert_set(Parameter.NUMBER_SAMPLES, 1)
+        self.assert_set(Parameter.NUMBER_SAMPLES, 9)
+        self.assert_set_exception(Parameter.NUMBER_SAMPLES, 10)
+        self.assert_set_exception(Parameter.NUMBER_SAMPLES, 0)
+        self.assert_set_exception(Parameter.NUMBER_SAMPLES, -1)
+        self.assert_set_exception(Parameter.NUMBER_SAMPLES, 0.2)
+        self.assert_set_exception(Parameter.NUMBER_SAMPLES, "1")
+        
+        # Menu wait time. integer 1 - 560
+        self.assert_set(Parameter.MENU_WAIT_TIME, 560)
+        self.assert_set(Parameter.MENU_WAIT_TIME, 1)
+        # need to actually set the menu wait time to greater than 1
+        # in order for code to be able to escape, set back to default
+        self.assert_set(Parameter.MENU_WAIT_TIME, 20)
+        self.assert_set_exception(Parameter.MENU_WAIT_TIME, 570)
+        self.assert_set_exception(Parameter.MENU_WAIT_TIME, 0)
+        self.assert_set_exception(Parameter.MENU_WAIT_TIME, -1)
+        self.assert_set_exception(Parameter.MENU_WAIT_TIME, 0.2)
+        self.assert_set_exception(Parameter.MENU_WAIT_TIME, "1")
+        
+        # Auto Sample Mode. AutoSampleMode enum
+        self.assert_set(Parameter.AUTO_SAMPLE_MODE, AutoSampleMode.DAILY_SAMPLE)
+        self.assert_set(Parameter.AUTO_SAMPLE_MODE, AutoSampleMode.CONTINUOUS_SAMPLE)
+        self.assert_set_exception(Parameter.AUTO_SAMPLE_MODE, 0)
+        self.assert_set_exception(Parameter.AUTO_SAMPLE_MODE, -1)
+        self.assert_set_exception(Parameter.AUTO_SAMPLE_MODE, 0.2)
+        self.assert_set_exception(Parameter.AUTO_SAMPLE_MODE, "1")
+        
+        # Atmosphere Mode. integer 0-2
+        self.assert_set(Parameter.ATMOSPHERE_MODE, 0)
+        self.assert_set(Parameter.ATMOSPHERE_MODE, 2)
+        self.assert_set_exception(Parameter.ATMOSPHERE_MODE, -1)
+        self.assert_set_exception(Parameter.ATMOSPHERE_MODE, 3)
+        self.assert_set_exception(Parameter.ATMOSPHERE_MODE, "1")
+          
+    def test_commands_and_autosample(self):
+        """
+        Run instrument commands from both command and auto sample mode, and
+        verify that we can enter streaming and that all particles are produced
+        properly.  Do this all in one test because it takes a half hour once you
+        go into auto sample mode.
+
+        Because we have to test for two different data particles we can't use
+        the common assert_sample_autosample method
+        """
+        
+        self.assert_initialize_driver()
+        
+        # make sure we are at the shortest auto sampling rate (excluding continuous)
+        self.assert_set(Parameter.AUTO_SAMPLE_MODE, AutoSampleMode.HALF_HR_SAMPLE)
+
+        # First test in command mode
+        self.assert_driver_command(ProtocolEvent.CLOCK_SYNC)
+        
+        # Test a bad command in command mode
+        self.assert_driver_command_exception('ima_bad_command',
+                                             exception_class=InstrumentCommandException)
+
+        # Put us in streaming
+        # delay of 20 to make sure we actually enter auto sample and don't escape again
+        self.assert_driver_command(ProtocolEvent.START_AUTOSAMPLE,
+                                   state=ProtocolState.AUTOSAMPLE, delay=20)
+        
+        # can't set clock in auto sample mode, should cause exception
+        self.assert_driver_command_exception(ProtocolEvent.CLOCK_SYNC,
+                                             exception_class=InstrumentCommandException)
+
+        # Test a bad command in autosample mode
+        self.assert_driver_command_exception('ima_bad_command',
+                                             exception_class=InstrumentCommandException)
+
+        # wait for air and water samples to arrive (need to wait an hour to account for 22 min
+        # startup, plus half hour before sample on minute 0 or 30)
+        self.assert_async_particle_generation(DataParticleType.PCO2A_AIR_SAMPLES,
+                                              self.assert_particle_air_sample, timeout=3600)
+        # both particles are taken at the same time, so there shouldn't be any delay between air
+        # and water samples, but just give it a few minutes in case
+        self.assert_async_particle_generation(DataParticleType.PCO2A_WATER_SAMPLES,
+                                              self.assert_particle_water_sample, timeout=360)
+        
+        # try to get out of auto sample mode ()
+        self.assert_driver_command(ProtocolEvent.STOP_AUTOSAMPLE, delay=1)
+        
+        # Test a bad command in wait for command mode
+        self.assert_driver_command_exception('ima_bad_command',
+                                             exception_class=InstrumentCommandException)
+        
+        # loop waiting for the instrument to come back from auto sample
+        self.assert_state_change(ProtocolState.COMMAND, timeout=1800, sleep_time=60)
+        
+    def test_discover_from_autosample_pre_sample(self):
+        """
+        Test that we can discover what mode we are in if the driver
+         starts and the instrument is put into auto sampling but hasn't actually
+         sampled yet.
+        """
+        
+        self.assert_initialize_driver()
+        
+        # make sure we are at the shortest auto sampling rate (excluding continuous)
+        self.assert_set(Parameter.AUTO_SAMPLE_MODE, AutoSampleMode.HALF_HR_SAMPLE)
+        # Put us in streaming
+        # delay of 20 to make sure we actually enter auto sample and don't escape again
+        self.assert_driver_command(ProtocolEvent.START_AUTOSAMPLE,
+                                   state=ProtocolState.AUTOSAMPLE, delay=20)
+        
+        # disconnect the driver
+        reply = self.driver_client.cmd_dvr('disconnect')
+        self.assertEqual(reply, None)
+
+        self.assert_current_state(DriverConnectionState.DISCONNECTED)
+        
+        # Initialize the driver and transition to unconfigured.
+        reply = self.driver_client.cmd_dvr('initialize')
+    
+        # Test the driver is in state unconfigured.
+        state = self.driver_client.cmd_dvr('get_resource_state')
+        self.assertEqual(state, DriverConnectionState.UNCONFIGURED)
+        
+        # Then reconnect the driver 
+        self.assert_initialize_driver()
+    
+    def test_discover_from_autosample_post_sample(self):
+        """
+        Test that we can discover what mode we are in if the driver starts and the 
+         instrument is auto sampling and has taken a sample.  In the post sample test, the
+         driver must initially realize that it is in autosample mode and exit out of it
+         into command mode.  In the pre_sample test, the driver gets the text to exit
+         autosample mode while it is still discovering. 
+        """
+        
+        self.assert_initialize_driver()
+        
+        # make sure we are at the shortest auto sampling rate (excluding continuous)
+        self.assert_set(Parameter.AUTO_SAMPLE_MODE, AutoSampleMode.HALF_HR_SAMPLE)
+        # Put us in streaming
+        # delay of 20 to make sure we actually enter auto sample and don't escape again
+        self.assert_driver_command(ProtocolEvent.START_AUTOSAMPLE,
+                                   state=ProtocolState.AUTOSAMPLE, delay=20)
+        
+        # wait for air and water samples to arrive (need to wait an hour to account for 22 min
+        # startup, plus half hour before sample on minute 0 or 30)
+        self.assert_async_particle_generation(DataParticleType.PCO2A_AIR_SAMPLES,
+                                              self.assert_particle_air_sample, timeout=3600)
+        # both particles are taken at the same time, so there shouldn't be any delay between air
+        # and water samples, but just give it a few minutes in case
+        self.assert_async_particle_generation(DataParticleType.PCO2A_WATER_SAMPLES,
+                                              self.assert_particle_water_sample, timeout=360)
+        
+        # disconnect the driver
+        reply = self.driver_client.cmd_dvr('disconnect')
+        self.assertEqual(reply, None)
+
+        self.assert_current_state(DriverConnectionState.DISCONNECTED)
+        
+        # Initialize the driver and transition to unconfigured.
+        reply = self.driver_client.cmd_dvr('initialize')
+    
+        # Test the driver is in state unconfigured.
+        state = self.driver_client.cmd_dvr('get_resource_state')
+        self.assertEqual(state, DriverConnectionState.UNCONFIGURED)
+        
+        # Then reconnect the driver 
+        self.assert_initialize_driver()
+                  
+    def assert_initialize_driver(self):
+        """
+        Walk an uninitialized driver through it's initialize process.  Verify the final
+        state is command mode.  
+        """
+        # Test the driver is in state unconfigured.
+        self.assert_current_state(DriverConnectionState.UNCONFIGURED)
+
+        # Configure driver for comms and transition to disconnected.
+        reply = self.driver_client.cmd_dvr('configure', self.port_agent_comm_config())
+
+        # Test the driver is configured for comms.
+        self.assert_current_state(DriverConnectionState.DISCONNECTED)
+
+        # Configure driver for comms and transition to disconnected.
+        reply = self.driver_client.cmd_dvr('connect')
+
+        # Test the driver is in unknown state.
+        self.assert_current_state(DriverProtocolState.UNKNOWN)
+        
+        # Configure driver for comms and transition to disconnected./
+        reply = self.driver_client.cmd_dvr('discover_state')
+        
+        # At this point state should always be either autosample or command,
+        # since that is what the discover handler is waiting for
+        state = self.driver_client.cmd_dvr('get_resource_state')
+        
+        # If we are in auto sample mode, try to break out of it
+        # (this may take a while, up to your sampling time)
+        if (state == ProtocolState.AUTOSAMPLE):
+            log.debug("Stopping auto sample to go to command")
+            reply = self.driver_client.cmd_dvr('execute_resource', ProtocolEvent.STOP_AUTOSAMPLE)
+        
+        # loop waiting until we discover command mode
+        self.assert_state_change(ProtocolState.COMMAND, timeout=3600, sleep_time=30)
+        
+        # Just make really sure the driver is in command mode.
+        self.assert_current_state(ProtocolState.COMMAND)      
 
 
 
@@ -420,7 +673,7 @@ class DriverIntegrationTest(InstrumentDriverIntegrationTestCase):
 # be tackled after all unit and integration tests are complete                #
 ###############################################################################
 @attr('QUAL', group='mi')
-class DriverQualificationTest(InstrumentDriverQualificationTestCase):
+class Pco2aQualificationTest(InstrumentDriverQualificationTestCase):
     def setUp(self):
         InstrumentDriverQualificationTestCase.setUp(self)
 

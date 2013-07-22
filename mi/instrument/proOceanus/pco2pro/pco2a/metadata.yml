@@ -1,8 +1,0 @@
-driver_metadata:
-  author: E. Hahn
-  driver_make: pco2a
-  driver_model: pco2pro
-  driver_name: ooicore
-  email: ehahn@bbn.com
-  release_notes: Initial revision.
-  version: 0.0.1

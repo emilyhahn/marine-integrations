@@ -14,6 +14,7 @@ __license__ = 'Apache 2.0'
 import re
 import string
 import time
+import thread
 
 from mi.core.log import get_logger ; log = get_logger()
 from mi.core.time import get_timestamp_delayed
@@ -25,7 +26,7 @@ from mi.core.exceptions import InstrumentTimeoutException
 
 from mi.core.common import BaseEnum
 from mi.core.instrument.instrument_protocol import CommandResponseInstrumentProtocol
-from mi.core.instrument.instrument_fsm import InstrumentFSM
+from mi.core.instrument.instrument_fsm import ThreadSafeFSM
 from mi.core.instrument.instrument_driver import SingleConnectionInstrumentDriver
 from mi.core.instrument.instrument_driver import DriverEvent
 from mi.core.instrument.instrument_driver import DriverAsyncEvent
@@ -89,8 +90,8 @@ class ProtocolEvent(BaseEnum):
     START_AUTOSAMPLE = DriverEvent.START_AUTOSAMPLE
     STOP_AUTOSAMPLE = DriverEvent.STOP_AUTOSAMPLE
     CLOCK_SYNC = DriverEvent.CLOCK_SYNC
-    DISCOVER_COMMAND = 'PROTOCOL_EVENT_DISCOVER_COMMAND'
-    DISCOVER_AUTOSAMPLE = 'PROTOCOL_EVENT_DISCOVER_AUTOSAMPLE'
+    WAIT_FOR_STATE = 'PROTOCOL_EVENT_WAIT_FOR_STATE'
+    INIT_PARAMS = 'PROTOCOL_EVENT_INIT_PARAMS'
     
 class Capability(BaseEnum):
     """
@@ -214,8 +215,7 @@ class Prompt(BaseEnum):
     SET_MONTH="Enter Month [##]"
     SET_DAY="Enter Day [##]"
     SET_HOUR="Enter Hour [##]"
-    SET_MIN="Enter Minute [##]"
-    # Seconds are not missing, they are not entered
+    SET_MINUTE="Enter Minute [##]"
     
 MENU_PROMPTS = [Prompt.MAIN_MENU, Prompt.AUTO_START_MENU]
 
@@ -239,8 +239,19 @@ WATER_REGEX_MATCHER = re.compile(WATER_REGEX)
 ESCAPE_AUTO_START_REGEX = r"Press Space-bar to escape Auto-Start \( \d+ Seconds \)...."
 ESCAPE_AUTO_START_MATCHER = re.compile(ESCAPE_AUTO_START_REGEX)
 # Half Hour Program, 3 Hour Program, Daily Program, Continuous Logging, No AutoStart Set
-AUTO_START_REGEX = r"Next Start Time = \d\d:\d\d\r\n|Loading User Variables...\r\n|Detector Warmup\r|ATM & Water Mode Warmup\r"
+AUTO_START_REGEX = r"Next Start Time = \d\d:\d\d\r\n|Loading User Variables...\r\n|Detector Flow On\r|Detector Warmup\r|ATM & Water Mode Warmup\r|P0\r|P1\r"
 AUTO_START_MATCHER = re.compile(AUTO_START_REGEX)
+
+# Sync time response regexes
+ENTER_MONTH_REGEX = r"Year = (\d+)\r\rEnter Month \[##\]"
+ENTER_MONTH_MATCHER = re.compile(ENTER_MONTH_REGEX)
+ENTER_DAY_REGEX = r"Month = (\d+)\r\rEnter Day \[##\]"
+ENTER_DAY_MATCHER = re.compile(ENTER_DAY_REGEX)
+ENTER_HOUR_REGEX = r"Day = (\d+)\r\rEnter Hour \[##\]"
+ENTER_HOUR_MATCHER = re.compile(ENTER_HOUR_REGEX)
+ENTER_MINUTE_REGEX = r"Hour = (\d+)\r\rEnter Minute \[##\]"
+ENTER_MINUTE_MATCHER = re.compile(ENTER_MINUTE_REGEX)
+MINUTE_RESP_MATCHER = re.compile("2\) View Logged Data          6\) Atmosphere Settings\r\n3\) Erase Logged Data         7\) Sleep Now\r\n4\) Change Clock Time         8\) View Live Data\r\n\r\n\r\nEnter Command >|" + ESCAPE_AUTO_START_REGEX)
 
 class Pco2aAirSampleDataParticleKey(BaseEnum):
     """
@@ -374,7 +385,6 @@ class Pco2aWaterSampleDataParticle(DataParticle):
         return result  
     
 
-
 ###############################################################################
 # Driver
 ###############################################################################
@@ -411,29 +421,7 @@ class Pco2aInstrumentDriver(SingleConnectionInstrumentDriver):
         """
         Construct the driver protocol state machine.
         """
-        self._protocol = Protocol(MENU, Prompt, NEWLINE, self._driver_event)
-        
-    def apply_startup_params(self):
-        """
-        Apply the startup values previously stored in the protocol to
-        the running config of the live instrument. The startup values are the
-        values that are (1) marked as startup parameters and are (2) the "best"
-        value to use at startup. Preference is given to the previously-set init
-        value, then the default value, then the currently used value.
-        
-        This default method assumes a dict of parameter name and value for
-        the configuration.
-        @raise InstrumentParameterException If the config cannot be applied
-        """
-        config = self._protocol.get_startup_config()
-        
-        if not isinstance(config, dict):
-            raise InstrumentParameterException("Incompatible initialization parameters")
-        
-        log.trace("driver applying config: %s", config)
-        self._protocol._set_parameters(config)
-        self.set_resource(config)
-        
+        self._protocol = Protocol(MENU, Prompt, NEWLINE, self._driver_event) 
         
 ###########################################################################
 # Protocol
@@ -456,18 +444,18 @@ class Protocol(MenuInstrumentProtocol):
         MenuInstrumentProtocol.__init__(self, menu, prompts, newline, driver_event)
         
         # Build protocol state machine.
-        self._protocol_fsm = InstrumentFSM(ProtocolState, ProtocolEvent,
+        self._protocol_fsm = ThreadSafeFSM(ProtocolState, ProtocolEvent,
                             ProtocolEvent.ENTER, ProtocolEvent.EXIT)
 
         # Add event handlers for protocol state machine.
         self._protocol_fsm.add_handler(ProtocolState.UNKNOWN, ProtocolEvent.ENTER, self._handler_unknown_enter)
-        self._protocol_fsm.add_handler(ProtocolState.UNKNOWN, ProtocolEvent.DISCOVER, self._handler_discover)
+        self._protocol_fsm.add_handler(ProtocolState.UNKNOWN, ProtocolEvent.DISCOVER, self._handler_unknown_discover)
+        self._protocol_fsm.add_handler(ProtocolState.UNKNOWN, ProtocolEvent.INIT_PARAMS, self._handler_command_init)
     
-        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.ENTER, self._handler_discover_enter)
-        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.DISCOVER, self._handler_discover)
-        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.DISCOVER_COMMAND, self._handler_discover_command)
+        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.ENTER, self._handler_discovery_enter)
+        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.WAIT_FOR_STATE, self._handler_discovery_wait_for_state)
         self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.START_DIRECT, self._handler_command_start_direct)
-        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.DISCOVER_AUTOSAMPLE, self._handler_discover_autosample)       
+        self._protocol_fsm.add_handler(ProtocolState.DISCOVERY, ProtocolEvent.INIT_PARAMS, self._handler_command_init)
                
         self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.ENTER, self._handler_command_enter)
         self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.START_DIRECT, self._handler_command_start_direct)
@@ -475,13 +463,15 @@ class Protocol(MenuInstrumentProtocol):
         self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.SET, self._handler_command_set)
         self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.CLOCK_SYNC, self._handler_command_clock_sync)
         self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.START_AUTOSAMPLE, self._handler_command_autosample)
-        self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.DISCOVER_AUTOSAMPLE, self._handler_discover_autosample)
+        self._protocol_fsm.add_handler(ProtocolState.COMMAND, ProtocolEvent.INIT_PARAMS, self._handler_command_init)
                                        
         self._protocol_fsm.add_handler(ProtocolState.AUTOSAMPLE, ProtocolEvent.ENTER, self._handler_autosample_enter)
         self._protocol_fsm.add_handler(ProtocolState.AUTOSAMPLE, ProtocolEvent.STOP_AUTOSAMPLE, self._handler_autosample_exit)
+        self._protocol_fsm.add_handler(ProtocolState.AUTOSAMPLE, ProtocolEvent.INIT_PARAMS, self._handler_autosample_init)
         
         self._protocol_fsm.add_handler(ProtocolState.WAIT_FOR_COMMAND, ProtocolEvent.ENTER, self._handler_wait_for_command_enter)
-        self._protocol_fsm.add_handler(ProtocolState.WAIT_FOR_COMMAND, ProtocolEvent.DISCOVER_COMMAND, self._handler_discover_wait_command)
+        self._protocol_fsm.add_handler(ProtocolState.WAIT_FOR_COMMAND, ProtocolEvent.WAIT_FOR_STATE, self._handler_wait_for_command_wait_for_state)
+        self._protocol_fsm.add_handler(ProtocolState.WAIT_FOR_COMMAND, ProtocolEvent.INIT_PARAMS, self._handler_command_init)
         
         self._protocol_fsm.add_handler(ProtocolState.DIRECT_ACCESS, ProtocolEvent.ENTER, self._handler_direct_access_enter)
         self._protocol_fsm.add_handler(ProtocolState.DIRECT_ACCESS, ProtocolEvent.EXIT, self._handler_direct_access_exit)
@@ -523,10 +513,10 @@ class Protocol(MenuInstrumentProtocol):
         self._add_response_handler(Command.CONFIRM_SET_TIME, self._parse_menu_change_response)
         self._add_response_handler(Command.SET_MENU_WAIT_TIME, self._parse_menu_change_response)
         self._add_response_handler(Command.CHANGE_ATMOSPHERE_MODE, self._parse_menu_change_response)
-        self._add_response_handler(Command.SET_YEAR, self._parse_menu_change_response)
-        self._add_response_handler(Command.SET_MONTH, self._parse_menu_change_response)
-        self._add_response_handler(Command.SET_DAY, self._parse_menu_change_response)
-        self._add_response_handler(Command.SET_HOUR, self._parse_menu_change_response)
+        self._add_response_handler(Command.SET_YEAR, self._parse_time_regex_response)
+        self._add_response_handler(Command.SET_MONTH, self._parse_time_regex_response)
+        self._add_response_handler(Command.SET_DAY, self._parse_time_regex_response)
+        self._add_response_handler(Command.SET_HOUR, self._parse_time_regex_response)
         self._add_response_handler(Command.SET_MINUTE, self._parse_menu_change_response)
         
 
@@ -713,8 +703,18 @@ class Protocol(MenuInstrumentProtocol):
         @param response Response that was sent back from the command
         @param prompt The prompt that was returned from the device
         """
-        log.trace("Parsing show parameter screen")
+        log.info("Parsing show parameter screen")
         self._param_dict.update_many(response)
+        
+    def _parse_time_regex_response(self, response, prompt):
+        """
+        Parse one of the result prompts from setting one of the time fields.
+        These will contain the value that the instrument received for that
+        field.  Return the matched value so error checking can be done. 
+        """
+        log.info("Parsing time regex response %s", response)
+        return response
+    
     
     ########################################################################
     # Utilities
@@ -759,63 +759,10 @@ class Protocol(MenuInstrumentProtocol):
         self._go_to_root_menu()
         new_config = self._param_dict.get_config()            
         if (new_config != old_config):
-            self._driver_event(DriverAsyncEvent.CONFIG_CHANGE)  
-        
-    def _initialize_params(self):
-        """
-        Initialize startup parameters
-        
-        @raise InstrumentTimeoutException - If instrument does not response to command in time
-        @raise InstrumentParameterException - If error setting a parameter to its initial value
-        """
-        log.info("Initializing parameters")
-        
-        # first get to the root menu
-        self._go_to_root_menu()
-        # all parameters are changed from the same menu, we can stay in this
-        # menu to set more parameters
-        # navigating to the change param menu will also update the currently
-        # stored parameters in the param dict
-        self._navigate(SubMenu.CHANGE_PARAM)
-        
-        param_key = [Parameter.AUTO_SAMPLE_MODE, Parameter.MENU_WAIT_TIME,
-                      Parameter.NUMBER_SAMPLES, Parameter.ATMOSPHERE_MODE]
-        for key in param_key:
-            # get current and initialization values
-            init_val = self._param_dict.get_init_value(key) 
-            current_val = self._param_dict.get(key)
-                
-            # Only try to change them if they arent set right as it is
-            log.info("Setting parameter: %s, current paramdict value: %s, init val: %s",
-                      key, str(current_val), str(init_val))
-            if (current_val != init_val):
-                
-                if (key == Parameter.AUTO_SAMPLE_MODE):
-                    result = self._do_cmd_resp(Command.CHANGE_AUTO_START_MODE,
-                                               self._from_autosample(init_val),
-                                               expected_prompt=Prompt.AUTO_START_PROMPT,
-                                               write_delay=1)
-                    if not result:
-                        raise InstrumentParameterException("Could not set param %s" % key)
-                elif (key == Parameter.NUMBER_SAMPLES):
-                    result = self._do_cmd_resp(Command.CHANGE_NUMBER_SAMPLES,
-                                               init_val,
-                                               expected_prompt=Prompt.CHANGE_NUMBER_SAMPLES,
-                                               write_delay=1)
-                    if not result:
-                        raise InstrumentParameterException("Could not set param %s" % key)
-                elif (key == Parameter.MENU_WAIT_TIME):
-                    result = self._do_cmd_resp(Command.SET_MENU_WAIT_TIME,
-                                               self._to_menu_wait_time(init_val),
-                                               expected_prompt=Prompt.MENU_WAIT_TIME,
-                                               write_delay=1)
-                    if not result:
-                        raise InstrumentParameterException("Could not set param %s" % key)
-                elif (key == Parameter.ATMOSPHERE_MODE):
-                    result = self._do_cmd_resp(Command.CHANGE_ATMOSPHERE_MODE,
-                                               init_val,
-                                               expected_prompt=Prompt.CHANGE_ATMOSPHERE,
-                                               write_delay=1)
+            self._driver_event(DriverAsyncEvent.CONFIG_CHANGE)
+            # Added this sleep to make sure the async config change takes affect 
+            #time.sleep(10)
+        log.info("Done updating parameter dict")
                        
     def _in_command_mode(self, numberTries=1):
         """
@@ -837,57 +784,67 @@ class Protocol(MenuInstrumentProtocol):
                 
         return False
     
-    def _set_parameters(self, params):
+    def _set_params(self, *args, **kwargs):
         """
         Set the value of each of the parameters input in the params argument.
         @param params - dictionary of parameters to set
         @raise InstrumentParameterException - if an invalid parameter is set
         @raise InstrumentProtocolException - if there is an error setting the parameter
         """
-        if ((params == None) or (not isinstance(params, dict))):
-            raise InstrumentParameterException()
+        log.debug("In _set_params")
+        startup = False
+        try:
+            params = args[0]
+        except IndexError:
+            raise InstrumentParameterException('Set command requires a parameter dict.')
+
+        try:
+            startup = args[1]
+        except IndexError:
+            pass
+        log.info("Setting parameters: %s", params)
+        self._verify_not_readonly(*args, **kwargs)
         
         self._go_to_root_menu()
         # all parameters are read/write and are in the auto start menu, we can
         # just stay in that menu for setting each parameter
         self._navigate(SubMenu.CHANGE_PARAM)
-        
-        name_values = params
-        for key in name_values.keys():
+
+        for (key, value) in params.iteritems():
             if not Parameter.has(key):
                 raise InstrumentParameterException()
-            
-            value = name_values[key]
 
             try:
                 if (key == Parameter.AUTO_SAMPLE_MODE):                             
                     self._do_cmd_resp(Command.CHANGE_AUTO_START_MODE,
                                       self._from_autosample(value),
                                       expected_prompt=[Prompt.AUTO_START_MENU],
-                                      write_delay=1)
+                                      write_delay=1, **kwargs)
                 elif (key == Parameter.MENU_WAIT_TIME):            
                     self._do_cmd_resp(Command.SET_MENU_WAIT_TIME, self._to_menu_wait_time(value),
                                       expected_prompt=[Prompt.AUTO_START_MENU],
-                                      write_delay=1)
+                                      write_delay=1, **kwargs)
                 elif (key == Parameter.NUMBER_SAMPLES):
                     if not isinstance(value, int) or value > 9 or value < 1:
                         raise InstrumentParameterException(
                             'Number of samples %s is not an integer or outside 1-9' % value)
                     self._do_cmd_resp(Command.CHANGE_NUMBER_SAMPLES, value,
                                       expected_prompt=[Prompt.AUTO_START_MENU],
-                                      write_delay=1)
+                                      write_delay=1, **kwargs)
                 elif (key == Parameter.ATMOSPHERE_MODE):
                     if not isinstance(value, int) or value > 2 or value < 0:
                         raise InstrumentParameterException(
                             'Atmosphere mode %s is not an integer or outside 0-2' % value)
                     self._do_cmd_resp(Command.CHANGE_ATMOSPHERE_MODE, value,
                                       expected_prompt=[Prompt.AUTO_START_MENU],
-                                      write_delay=1)
+                                      write_delay=1, **kwargs)
             except InstrumentProtocolException:
                 self._go_to_root_menu()
                 raise InstrumentProtocolException("Could not set parameter %s"  % key)
+            
+        self._update_params()
                 
-    def _sync_clock(self, cmd_timeout=10, time_format="%Y %m %d %H:%M:%S"):
+    def _sync_clock(self, zero_year=False):
         """
         Sync the clock to the current time.
         @param cmd_timeout - optional timeout on commands
@@ -903,10 +860,14 @@ class Protocol(MenuInstrumentProtocol):
         # waits for the set and confirm commands
         total_delay = (char_delay * 12) + 2
         
+        cmd_timeout=30
+        
         # get the current time aligned to the closet minute, since we cannot set seconds,
         # with a delay of the seconds it will take to set the time
+        time_format="%Y %m %d %H:%M:%S"
         str_val = get_timestamp_delayed(time_format, align='minute', offset=total_delay)
         log.info("Set time value == '%s' delayed %s", str_val, total_delay)
+        success = True
         
         self._go_to_root_menu()
         response = self._do_cmd_resp(Command.SET_CLOCK,
@@ -920,38 +881,82 @@ class Protocol(MenuInstrumentProtocol):
                                          write_delay=1,
                                          expected_prompt=[Prompt.SET_YEAR])
             if response == Prompt.SET_YEAR:
-                response = self._do_cmd_resp(Command.SET_YEAR, str_val[0:4],
-                                             timeout=cmd_timeout,
-                                             write_delay=char_delay,
-                                             expected_prompt=[Prompt.SET_MONTH])
-                if response == Prompt.SET_MONTH:
-                    response = self._do_cmd_resp(Command.SET_MONTH, str_val[5:7],
-                                                 timeout=cmd_timeout,
-                                                 write_delay=char_delay,
-                                                 expected_prompt=[Prompt.SET_DAY])
-                    if response == Prompt.SET_DAY:
-                        response = self._do_cmd_resp(Command.SET_DAY, str_val[8:10],
-                                                     timeout=cmd_timeout,
-                                                     write_delay=char_delay,
-                                                     expected_prompt=[Prompt.SET_HOUR])
-                        if response == Prompt.SET_HOUR:
-                            response = self._do_cmd_resp(Command.SET_HOUR,
-                                                         str_val[11:13],
-                                                         timeout=cmd_timeout,
-                                                         write_delay=char_delay,
-                                                         expected_prompt=[Prompt.SET_MIN])
-                            if response == Prompt.SET_MIN:
-                                response = self._do_cmd_resp(Command.SET_MINUTE,
-                                                             str_val[14:16],
-                                                             timeout=cmd_timeout,
-                                                             write_delay=char_delay,
-                                                             expected_prompt=[Prompt.MAIN_MENU])
+                # Sometimes the clock does not sync properly for unknown reasons,
+                # and adds an extra digit to the end (i.e 20134 instead of 2013)
+                # Setting the time with a last digit of 0 seems to clear this
+                # extra digit so you can set the time again
+                if zero_year:
+                    log.info("Setting last year digit to zero")
+                    year_str = str_val[0:3] + "0"
+                else:
+                    year_str = str_val[0:4]    
+                response = self._do_cmd_resp(Command.SET_YEAR, year_str,
+                                         timeout=cmd_timeout,
+                                         write_delay=char_delay,
+                                         response_regex=ENTER_MONTH_MATCHER)
+                year_match = ENTER_MONTH_MATCHER.search(response)
+                if (not year_match or year_match.group(1) != year_str):
+                    log.debug("Year did not match")
+                    success = False
+                response = self._do_cmd_resp(Command.SET_MONTH, str_val[5:7],
+                                          timeout=cmd_timeout,
+                                          write_delay=char_delay,
+                                          response_regex=ENTER_DAY_MATCHER)
+                month_match = ENTER_DAY_MATCHER.search(response)
+                if (not month_match or month_match.group(1) != str_val[5:7]):
+                    log.debug("Month did not match")
+                    success = False
+                response = self._do_cmd_resp(Command.SET_DAY, str_val[8:10],
+                                        timeout=cmd_timeout,
+                                        write_delay=char_delay,
+                                        response_regex=ENTER_HOUR_MATCHER)
+                day_match = ENTER_HOUR_MATCHER.search(response)
+                if (not day_match or day_match.group(1) != str_val[8:10]):
+                    log.debug("Day did not match")
+                    success = False
+                response = self._do_cmd_resp(Command.SET_HOUR, str_val[11:13],
+                                         timeout=cmd_timeout,
+                                         write_delay=char_delay,
+                                         response_regex=ENTER_MINUTE_MATCHER)
+                hour_match = ENTER_MINUTE_MATCHER.search(response)
+                if (not hour_match or hour_match.group(1) != str_val[11:13]):
+                    log.debug("Hour did not match")
+                    success = False
+                # Try to match either the main menu or escape from auto start
+                # text for the response
+                response = self._do_cmd_resp(Command.SET_MINUTE, str_val[14:16],
+                                            timeout=cmd_timeout,
+                                            write_delay=char_delay,
+                                            response_regex = MINUTE_RESP_MATCHER)
+                                            #expected_prompt=[Prompt.MAIN_MENU])
+                # I think due to timing, sometimes the clock sync just goes right
+                # to 'sleep', which starts auto sample.  We don't want that to
+                # happen, so send a space to stay in command                            
+                escape_auto_match = ESCAPE_AUTO_START_MATCHER.search(response)
+                if (escape_auto_match):
+                    response = self._do_cmd_resp(Command.SPACE, 
+                                            timeout=cmd_timeout,
+                                            expected_prompt=[Prompt.MAIN_MENU])
+            else:
+                success = False
+        else:
+            success = False
+        if success:
+            log.debug("Setting clock successful")
+        return success
+                
                                         
     def _wakeup(self, timeout=None):
         """
         Override wakeup so that nothing happens.
         """
         pass
+    
+    def _new_event(self, protocol_event_type):
+        """
+        This function is used to start a new event in a new thread.  
+        """
+        self._protocol_fsm.on_event(protocol_event_type)
               
 
     ########################################################################
@@ -966,7 +971,7 @@ class Protocol(MenuInstrumentProtocol):
         # Superclass will query the state.
         self._driver_event(DriverAsyncEvent.STATE_CHANGE)
            
-    def _handler_discover(self, *args, **kwargs):
+    def _handler_unknown_discover(self, *args, **kwargs):
         """
         Check if the instrument is responding to commands.  If it is,
         enter command state, otherwise go into discovery state.
@@ -976,43 +981,47 @@ class Protocol(MenuInstrumentProtocol):
         next_agent_state = None
         result = None
         
-        log.info("Had discover event")
+        log.debug("Had discover event")
         # loop multiple times trying to get in command mode in case
         # the instrument is booting up
         if self._in_command_mode(numberTries=2):
-            # do initialization
-            self._initialize_params()
-
             next_state = ProtocolState.COMMAND
-            next_agent_state = ResourceAgentState.COMMAND
+            next_agent_state = ResourceAgentState.IDLE
         else:
             next_state = ProtocolState.DISCOVERY
             next_agent_state = ResourceAgentState.BUSY
-      
-        return (next_state, (next_agent_state, result))
+        return (next_state, next_agent_state)       
         
     
     ########################################################################
     # Discovery handlers
     ########################################################################
-    def _handler_discover_enter(self, *args, **kwargs):
+    def _handler_discovery_enter(self, *args, **kwargs):
         """
-        Enter discover state.
-        Perform an additional loop here which waits for text indiciating the
-        instrument is either in command or auto sample mode.  There is only a
-        limited time window to response once the escape from auto sample text
-        has appeared.
+        Enter discover state.  Start a new thread which handles waiting for
+        discovery text from the instrument to arrive.  
         """
         # Tell driver superclass to send a state change event.
         # Superclass will query the state.
         self._driver_event(DriverAsyncEvent.STATE_CHANGE)
+        
+        thread.start_new_thread(self._new_event, (ProtocolEvent.WAIT_FOR_STATE, ))
+        
+    def _handler_discovery_wait_for_state(self, *args, **kwargs):
+        """
+        Loop waiting for the instrument to output text which indicates what state it is in.
+        @ raise InstrumentTimeoutException - if no state is found within timeout
+        """
+        next_state = None
+        next_agent_state = None
+        result = None
         
         matcher_set = [ AIR_REGEX_MATCHER,
                         WATER_REGEX_MATCHER,
                         ESCAPE_AUTO_START_MATCHER,
                         AUTO_START_MATCHER]
         
-        log.debug("In discovery, waiting for command or autosample")
+        log.info("waiting for command or autosample")
         # wait for two hours, this handles if we are at the default sample rate of one hour.
         # If the sample rate is longer than an hour, this timeout should be increased
         timeout = 7200
@@ -1022,50 +1031,28 @@ class Protocol(MenuInstrumentProtocol):
                 found_match = matcher.search(self._promptbuf)
                 if found_match:
                     if matcher == ESCAPE_AUTO_START_MATCHER:
-                        log.debug("Discovered escape from auto sample text")
-                        self._protocol_fsm.on_event(ProtocolEvent.DISCOVER_COMMAND)
-                        return
+                        log.info("Discovered escape from auto sample text")
+                        self._do_cmd_resp(Command.SPACE, timeout=30, expected_prompt=Prompt.MAIN_MENU)
+                        next_state = ProtocolState.COMMAND
+                        next_agent_state = ResourceAgentState.IDLE
                     else:
-                        log.debug("Discovered auto sampling")
-                        self._protocol_fsm.on_event(ProtocolEvent.DISCOVER_AUTOSAMPLE)
-                        return
+                        log.info("Discovered auto sampling")
+                        next_state = ProtocolState.AUTOSAMPLE
+                        next_agent_state = ResourceAgentState.STREAMING
+                    break
                 else:
                     time.sleep(.5)
-
+            if next_state is not None:
+                break
             if time.time() > starttime + timeout:
-                raise InstrumentTimeoutException("no state discovered in InstrumentProtocol._handler_discover_enter()")
-        
-    def _handler_discover_command(self, *args, **kwargs):
-        """
-        Enter discover command mode
-        At this point, the escape from auto sampling text has been seen.
-        Send a space to break out, and hopefully get the main menu back.
-        Then initialize command state and move into it.
-        @retval (next_state, (next_agent_state, result))
-        """
-        result = None
-        
-        log.debug("Trying to break out of auto sampling")
-        self._do_cmd_resp(Command.SPACE, timeout=30, expected_prompt=Prompt.MAIN_MENU)
-        
-        # do initialization
-        self._initialize_params()
-               
-        # set to command mode
-        next_state = ProtocolState.COMMAND
-        next_agent_state = ResourceAgentState.COMMAND
+                raise InstrumentTimeoutException("no state discovered in _wait_for_state()")
+            
+        log.debug("Next state is %s", next_state)    
+        if next_state is not None:  
+            self._async_agent_state_change(next_agent_state)
+            log.debug('Should have async changed agent states')
         return (next_state, (next_agent_state, result))
-    
-    def _handler_discover_autosample(self, *args, **kwargs):
-        """
-        Found a message indicating we are in auto sample mode, enter auto sample.
-        @retval (next_state, (next_agent_state, result))
-        """
-        # set to autosample mode
-        result = None
-        next_state = ProtocolState.AUTOSAMPLE
-        next_agent_state = ResourceAgentState.STREAMING
-        return (next_state, (next_agent_state, result))
+
     
     ########################################################################
     # Command handlers.
@@ -1078,49 +1065,35 @@ class Protocol(MenuInstrumentProtocol):
         @throws InstrumentProtocolException if the update commands and not recognized.
         """
         log.debug("Entering command state")
+        # initializing params is different if coming from command or autosample
+        self._protocol_fsm.on_event(ProtocolEvent.INIT_PARAMS)
+        log.debug("Done with INIT_PARAMS event")
         # Tell driver superclass to send a state change event.
         # Superclass will query the state.
         self._driver_event(DriverAsyncEvent.STATE_CHANGE)
         
-        # Command device to update parameters and send a config change event.
-        self._update_params()
+    def _handler_command_init(self, *args, **kwargs):
+        """
+        Do initialization
+        """
+        next_state = None
+        next_agent_state = None
+        result = None
+        
+        # do initialization
+        self._init_params()
+        return (next_state, (next_agent_state, result))
 
-    def _handler_command_get(self, params=None, *args, **kwargs):
+    def _handler_command_get(self, *args, **kwargs):
         """
         Get parameters while in the command state.
         @param params List of the parameters to pass to the state
-        @retval returns (next_state, result) where result is a dict {}. No
-            agent state changes happening with Get, so no next_agent_state
+        @retval returns (next_state, (next_agent_state, result)) where result is a dict {}. 
         @throw InstrumentParameterException for invalid parameter
         """
-        next_state = None
-        result = None
-        result_vals = {}
-        
-        if (params == None):
-            raise InstrumentParameterException("GET parameter list empty!")
-            
-        if (params == Parameter.ALL):
-            params = [Parameter.AUTO_SAMPLE_MODE, Parameter.MENU_WAIT_TIME,
-                      Parameter.NUMBER_SAMPLES, Parameter.ATMOSPHERE_MODE]
-            
-        if not isinstance(params, list):
-            raise InstrumentParameterException("GET parameter list not a list!")
-
-        # Do a bulk update from the instrument since they are all on one page
-        self._update_params()
-        
-        # fill the return values from the update
-        for param in params:
-            if not Parameter.has(param):
-                raise InstrumentParameterException("Invalid parameter!")
-            result_vals[param] = self._param_dict.get(param) 
-        result = result_vals
-
-        log.debug("Get finished, next: %s, result: %s", next_state, result) 
-        return (next_state, result)
+        return self._handler_get(*args, **kwargs)
     
-    def _handler_command_set(self, params, *args, **kwargs):
+    def _handler_command_set(self, *args, **kwargs):
         """
         Handle setting data from command mode
          
@@ -1130,24 +1103,37 @@ class Protocol(MenuInstrumentProtocol):
         """
         next_state = None
         result = None
-        
-        self._set_parameters(params)
-
-        self._update_params()
+        log.debug("In _handler_command_set")
+                
+        self._set_params(*args, **kwargs)
                    
         return (next_state, result)
     
-    
     def _handler_command_clock_sync(self, *args, **kwargs):
         """
-        Handle setting the clock.  This requires stepping through many menu steps
+        Handle setting the clock.  The clock may not set correctly,
+        and if it doesn't there is a corrective measure that can be
+        taken to try to fix it.  If the clock gets set to a strange
+        time, this will throw off when the instrument takes samples,
+        (i.e. not for thousands of years if the year is off...)
         @retval (next_state, (next_agent_state, result))
         """
         next_state = None
         next_agent_state = None
         result = None
         
-        self._sync_clock()
+        success = self._sync_clock()
+        
+        timeout = 600
+        starttime = time.time()
+        while not success:
+            log.debug("Failed to set clock, zeroing last digit")
+            self._sync_clock(zero_year=True)
+            log.debug("Syncing clock again")
+            success = self._sync_clock()
+            
+            if time.time() > (starttime + timeout):
+                raise InstrumentTimeoutException("could not sync clock successfully within 10 min")
                                 
         return (next_state, (next_agent_state, result))
     
@@ -1162,12 +1148,15 @@ class Protocol(MenuInstrumentProtocol):
         
         self._go_to_root_menu()
         self._do_cmd_no_resp(Command.START_AUTOSAMPLE)
+        # sleep 20 seconds so that we get past the timeout where we can
+        # escape from auto sampling
+        log.debug("Sleeping 20 s to avoid escaping out of autosample")
+        time.sleep(20)
         
         next_state = ProtocolState.AUTOSAMPLE
         next_agent_state = ResourceAgentState.STREAMING
         
         return (next_state, (next_agent_state, result))
-      
 
     def _handler_command_start_direct(self, *args, **kwargs):
         """
@@ -1210,6 +1199,49 @@ class Protocol(MenuInstrumentProtocol):
         
         return (next_state, (next_agent_state, result))
     
+    def _handler_autosample_init(self, *args, **kwargs):
+        """
+        initialize parameters.  We need to put the instrument into
+        command mode, apply the parameters, then put it back.
+        """
+        next_state = None
+        next_agent_state = None
+        result = None
+        error = None
+        
+        log.info("Initializing params from autosample")
+        try:
+            if not self._in_command_mode():
+                log.debug("waiting for escape from autosample text")
+                timeout = 7200
+                starttime = time.time()
+                while True:
+                    if ESCAPE_AUTO_START_MATCHER.search(self._promptbuf):
+                        log.info("Discovered escape from auto sample text")
+                        self._do_cmd_resp(Command.SPACE, timeout=30, expected_prompt=Prompt.MAIN_MENU)
+                        break
+                    else:
+                        time.sleep(.1)
+
+                    if time.time() > (starttime + timeout):
+                        raise InstrumentTimeoutException("no state discovered in _handler_autosample_init()")
+                
+            self._init_params()
+            log.info("Done with _init_params")
+        # Catch all error so we can put ourself back into
+        # streaming.  Then rethrow the error
+        except Exception as e:
+            error = e
+
+        finally:
+            self._go_to_root_menu()
+            self._do_cmd_no_resp(Command.START_AUTOSAMPLE)
+
+        if(error):
+            log.error("Error initializing params from autosample: %s", error)
+            raise error
+        return (next_state, (next_agent_state, result))
+    
     ########################################################################
     # Wait for command handlers
     ########################################################################
@@ -1223,8 +1255,16 @@ class Protocol(MenuInstrumentProtocol):
         # Superclass will query the state.
         self._driver_event(DriverAsyncEvent.STATE_CHANGE)
         
-        matcher_set = [ ESCAPE_AUTO_START_MATCHER,
-                        AUTO_START_MATCHER]
+        thread.start_new_thread(self._new_event, (ProtocolEvent.WAIT_FOR_STATE, ))
+        
+    def _handler_wait_for_command_wait_for_state(self, *args, **kwargs):
+        """
+        Found the escape command mode trigger, go into command mode.
+        @retval (next_state, (next_agent_state, result))
+        """
+        next_state = None
+        next_agent_state = None
+        result = None
         
         log.debug("In wait for command, waiting for escape from autosample text")
         timeout = 7200
@@ -1232,27 +1272,21 @@ class Protocol(MenuInstrumentProtocol):
         while True:
             if ESCAPE_AUTO_START_MATCHER.search(self._promptbuf):
                 log.debug("Discovered escape from auto sample text")
-                self._protocol_fsm.on_event(ProtocolEvent.DISCOVER_COMMAND)
-                return
+                # send space to tell instrument to not start auto sampling
+                self._do_cmd_resp(Command.SPACE, timeout=30, expected_prompt=Prompt.MAIN_MENU)
+                next_state = ProtocolState.COMMAND
+                next_agent_state = ResourceAgentState.COMMAND
+                break
             else:
                 time.sleep(.1)
 
             if time.time() > starttime + timeout:
-                raise InstrumentTimeoutException("no state discovered in InstrumentProtocol._handler_discover_enter()")
-        
-    def _handler_discover_wait_command(self, *args, **kwargs):
-        """
-        Found the escape command mode trigger, go into command mode.
-        @retval (next_state, (next_agent_state, result))
-        """
-        # send space to tell instrument to not start auto sampling
-        log.debug("Trying to break out of auto sampling")
-        self._do_cmd_resp(Command.SPACE, timeout=30, expected_prompt=Prompt.MAIN_MENU)
-        result = None
-        
-        # set to command mode
-        next_state = ProtocolState.COMMAND
-        next_agent_state = ResourceAgentState.COMMAND
+                raise InstrumentTimeoutException("no state discovered in _handler_wait_for_command_wait_for_state()")
+            
+        log.debug("Returning state %s", next_state)    
+        if next_state is not None:  
+            self._async_agent_state_change(next_agent_state)
+            log.info('Should have async changed agent states')
         return (next_state, (next_agent_state, result))
     
         
@@ -1299,9 +1333,13 @@ class Protocol(MenuInstrumentProtocol):
         """
         next_state = None
         result = None
-
-        next_state = ProtocolState.COMMAND
-        next_agent_state = ResourceAgentState.COMMAND
+        
+        if self._in_command_mode():
+            next_state = ProtocolState.COMMAND
+            next_agent_state = ResourceAgentState.COMMAND
+        else:
+            next_state = ProtocolState.WAIT_FOR_COMMAND
+            next_agent_state = ResourceAgentState.STREAMING
 
         return (next_state, (next_agent_state, result))
     

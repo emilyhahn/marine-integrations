@@ -59,14 +59,16 @@ class TcpClient():
         return c
 
     def peek_at_buffer(self):
-        if len(self.buf) == 0:
-            try:
-                self.buf = self.s.recv(BUFFER_SIZE)
-                log.debug("RAW READ GOT '" + str(repr(self.buf)) + "'")
-            except:
-                """
-                Ignore this exception, its harmless
-                """
+        try:
+            temp = self.s.recv(BUFFER_SIZE)
+            if len(temp) > 0:
+                self.buf += temp
+                log.debug("RAW READ BUF '" + str(repr(self.buf)) + "'")
+        except:
+            """
+            Ignore this exception
+            """
+            log.debug("ignoring exception in peek_at_buffer")
         return self.buf
 
     def remove_from_buffer(self, remove):

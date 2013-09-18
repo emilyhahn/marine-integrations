@@ -3,6 +3,7 @@
 @author Emily Hahn
 @brief Main script class for running the package_driver process
 """
+import subprocess
 
 from mi.core.log import get_logger ; log = get_logger()
 
@@ -51,18 +52,58 @@ class PackageDriver(mi.idk.package_driver.PackageDriver):
             log.error("Qualification tests have fail!  No package created.")
             return False
         
+    def get_repackage_version(self):
+        """
+        Get the driver version the user wants to repackage
+        """
+        # suggest the current driver version as default
+        repkg_version = prompt.text( 'Driver Version to re-package', self.metadata.version )
+        # check to make sure this driver version exists
+        tag_name = self.metadata.driver_name + '_' + repkg_version
+        cmd = 'git tag -l ' + tag_name 
+        # find out if this tag name exists
+        output = subprocess.check_output(cmd)
+        if len(output) > 0:
+            # this tag exists, check it out
+            os.system('git checkout tags/' + tag_name)
+            # re-read the metadata since we may have changed the metadata.yml file
+            self.metadata = Metadata()
+        else:
+            log.error('No driver version %s found', tag_name)
+            
+    def make_branch(self):
+        """
+        Make a new branch for this release and tag it with the same name so we
+        can get back to it
+        """
+        name = self.metadata.versioned_driver_name
+        # create a new branch name and check it out
+        cmd = 'git checkout -b ' + name
+        os.system(cmd)
+        log.debug('created new branch %s', name)
+        # tag the initial branch so that we can get back to it later
+        cmd = 'git tag ' + name
+        os.system(cmd)
+        log.debug('create new tag %s', name)
         
     def run(self):
-        print "*** Starting Driver Packaging Process***"
+        print "*** Starting Driver Packaging Process ***"
         
         # for now comment out the test option until test are more stable,
         # just build the package driver
+        if len(sys.argv) == 2 and (sys.argv[1] == "--repackage"):
+            self.get_repackage_version()
+            self.package_driver()
+        else:
+            self.update_version()
+            self.make_branch()
+            self.package_driver()
         #if len(sys.argv) == 2 and (sys.argv[1] == "--no-test"):
             # clear the log file so it exists
             #f = open(self.log_path(), "w")
             #f.write("Tests manually bypassed with --no-test option\n")
             #f.close()
-        self.package_driver()
+            #self.package_driver()
         #else:
         #    if(self.run_qualification_tests()):
         #        self.package_driver()

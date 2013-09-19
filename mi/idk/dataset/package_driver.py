@@ -3,6 +3,7 @@
 @author Emily Hahn
 @brief Main script class for running the package_driver process
 """
+import os
 import sys
 import subprocess
 
@@ -88,11 +89,15 @@ class PackageDriver(mi.idk.package_driver.PackageDriver):
             raise InvalidParameters('There are uncommitted changes, please commit all changes before running package driver')
         # create a new branch name and check it out
         cmd = 'git checkout -b ' + name
-        os.system(cmd)
+        output = subprocess.check_output(cmd, shell=True)
+        if len(output) > 0:
+            log.debug('new branch checkout returned: %s', output)
         log.debug('created new branch %s', name)
         # tag the initial branch so that we can get back to it later
         cmd = 'git tag ' + name
-        os.system(cmd)
+        output = subprocess.check_output(cmd, shell=True)
+        if len(output) > 0:
+            log.debug('tag create returned: %s', output)
         log.debug('create new tag %s', name)
         
     def run(self):

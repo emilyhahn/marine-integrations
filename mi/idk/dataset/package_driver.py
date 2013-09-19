@@ -3,11 +3,13 @@
 @author Emily Hahn
 @brief Main script class for running the package_driver process
 """
+import sys
 import subprocess
 
 from mi.core.log import get_logger ; log = get_logger()
 
 import mi.idk.package_driver
+from mi.idk.exceptions import InvalidParameters
 
 from mi.idk.dataset.metadata import Metadata
 from mi.idk.dataset.nose_test import NoseTest
@@ -62,7 +64,7 @@ class PackageDriver(mi.idk.package_driver.PackageDriver):
         tag_name = self.metadata.driver_name + '_' + repkg_version
         cmd = 'git tag -l ' + tag_name 
         # find out if this tag name exists
-        output = subprocess.check_output(cmd)
+        output = subprocess.check_output(cmd, shell=True)
         if len(output) > 0:
             # this tag exists, check it out
             os.system('git checkout tags/' + tag_name)
@@ -70,13 +72,20 @@ class PackageDriver(mi.idk.package_driver.PackageDriver):
             self.metadata = Metadata()
         else:
             log.error('No driver version %s found', tag_name)
+            raise InvalidParameters('No driver version %s found', tag_name)
             
     def make_branch(self):
         """
         Make a new branch for this release and tag it with the same name so we
         can get back to it
         """
-        name = self.metadata.versioned_driver_name
+        name = self.metadata.driver_name_versioned
+        # make sure there are no modified files
+        cmd = 'git diff --name-only --ignore-submodules'
+        output = subprocess.check_output(cmd, shell=True)
+        if len(output) > 0:
+            log.error('There are uncommitted changes, please commit all changes before running package_driver')
+            raise InvalidParameters('There are uncommitted changes, please commit all changes before running package driver')
         # create a new branch name and check it out
         cmd = 'git checkout -b ' + name
         os.system(cmd)
